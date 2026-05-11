@@ -7,7 +7,6 @@ from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
 from typing import Any
 
-import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -19,6 +18,7 @@ APP_TITLE = "동시간대 편성 체크"
 # 크롤링 대상 사이트입니다.
 # 사이트 구조가 바뀌면 fetch_tv_schedule(), fetch_homeshopping_schedule()만
 # 먼저 확인하면 되도록 나머지 로직은 함수로 분리했습니다.
+EPG_GUIDE_PAGE_URL = "http://www.epgguide.co.kr/page/tv.php"
 EPG_GUIDE_PROGRAM_URL = "http://www.epgguide.co.kr/mod/ajax.get_program.php"
 ECOMM_SCHEDULE_PAGE_URL = "https://live.ecomm-data.com/schedule/hs"
 ECOMM_DATA_BASE_URL = "https://live.ecomm-data.com/_next/data"
@@ -32,6 +32,13 @@ REQUEST_HEADERS = {
     ),
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": ECOMM_SCHEDULE_PAGE_URL,
+}
+
+TV_REQUEST_HEADERS = {
+    **REQUEST_HEADERS,
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Referer": EPG_GUIDE_PAGE_URL,
+    "X-Requested-With": "XMLHttpRequest",
 }
 
 
@@ -175,6 +182,24 @@ def get_page(
         return requests.get(url, verify=False, **kwargs)
 
 
+def get_json_response(response: requests.Response) -> dict[str, Any]:
+    """응답이 JSON인지 확인한 뒤 dict로 변환합니다."""
+    text = response.text.strip()
+    if not text:
+        raise ValueError("편성표 사이트가 빈 응답을 반환했습니다.")
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        preview = text[:80].replace("\n", " ")
+        raise ValueError(f"JSON 응답이 아닙니다. 응답 앞부분: {preview}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("편성표 사이트 응답 형식이 예상과 다릅니다.")
+
+    return data
+
+
 def fetch_tv_schedule(
     selected_channels: list[dict[str, str]],
     broadcast_start: datetime,
@@ -208,12 +233,14 @@ def fetch_tv_schedule(
                 response = get_page(
                     EPG_GUIDE_PROGRAM_URL,
                     params=params,
-                    headers=REQUEST_HEADERS,
+                    headers=TV_REQUEST_HEADERS,
                     timeout=15,
                 )
                 response.raise_for_status()
-                data = response.json()
+                data = get_json_response(response)
                 html = data.get("html", "")
+                if not html:
+                    raise ValueError("편성표 HTML이 비어 있습니다.")
                 programs.extend(parse_tv_schedule_html(html, channel["label"], target_date))
             except Exception as exc:
                 errors.append(f"{channel['label']} TV 편성표를 불러오지 못했습니다. ({exc})")
@@ -738,115 +765,6 @@ def get_selected_homeshopping_codes(selected_channel_names: list[str]) -> set[st
     return selected_codes
 
 
-def build_timeline_chart_data(
-    tv_programs: list[dict[str, Any]],
-    homeshopping_schedules: list[dict[str, Any]],
-    selected_homeshopping_channels: list[str],
-    broadcast_start: datetime,
-    broadcast_end: datetime,
-) -> pd.DataFrame:
-    """표에 나온 편성을 시간축 그래프로 그릴 수 있는 데이터로 바꿉니다."""
-    rows: list[dict[str, Any]] = []
-
-    for program in tv_programs:
-        program_start = program["start"]
-        program_end = program["end"]
-        overlaps_my_broadcast = program_start < broadcast_end and program_end > broadcast_start
-        ends_during_my_broadcast = broadcast_start <= program_end <= broadcast_end
-        if not (overlaps_my_broadcast or ends_during_my_broadcast):
-            continue
-
-        rows.append(
-            {
-                "구분": "TV",
-                "채널": program["channel"],
-                "항목": program["program_name"],
-                "시작": program_start,
-                "종료": program_end,
-                "시작표시": format_table_time(program_start, broadcast_start.date()),
-                "종료표시": format_table_time(program_end, broadcast_start.date()),
-                "_sort_group": 0,
-                "_sort_channel": CORE_TV_CHANNEL_ORDER.get(program["channel"], 99),
-            }
-        )
-
-    selected_codes = get_selected_homeshopping_codes(selected_homeshopping_channels)
-    seen_keys: set[str] = set()
-    for item in homeshopping_schedules:
-        channel_code = str(
-            item.get("platform_id")
-            or item.get("tv_channel")
-            or item.get("site")
-            or item.get("channel")
-            or item.get("channel_code")
-            or ""
-        )
-        channel_name = str(item.get("platform_name") or "").strip()
-
-        if selected_codes and channel_code and channel_code not in selected_codes:
-            continue
-        if selected_codes and not channel_code and channel_name not in selected_homeshopping_channels:
-            continue
-
-        start_dt = parse_datetime_value(
-            item.get("hsshow_datetime_start")
-            or item.get("start_datetime")
-            or item.get("broadcast_start_datetime")
-            or item.get("startDateTime")
-            or item.get("start_time")
-        )
-        end_dt = parse_datetime_value(
-            item.get("hsshow_datetime_end")
-            or item.get("end_datetime")
-            or item.get("broadcast_end_datetime")
-            or item.get("endDateTime")
-            or item.get("end_time")
-        )
-        if start_dt is None or end_dt is None:
-            continue
-        if not (start_dt < broadcast_end and end_dt > broadcast_start):
-            continue
-
-        product_name = str(
-            item.get("hsshow_title")
-            or item.get("name")
-            or item.get("product_name")
-            or item.get("productName")
-            or item.get("title")
-            or ""
-        ).strip() or "상품명 확인 필요"
-        unique_key = f"{channel_code}|{product_name}|{start_dt:%Y%m%d%H%M}|{end_dt:%Y%m%d%H%M}"
-        if unique_key in seen_keys:
-            continue
-        seen_keys.add(unique_key)
-
-        display_channel = HOMESHOPPING_CODE_TO_NAME.get(
-            channel_code,
-            channel_name or channel_code or "확인 필요",
-        )
-        rows.append(
-            {
-                "구분": "홈쇼핑",
-                "채널": display_channel,
-                "항목": product_name,
-                "시작": start_dt,
-                "종료": end_dt,
-                "시작표시": format_table_time(start_dt, broadcast_start.date()),
-                "종료표시": format_table_time(end_dt, broadcast_start.date()),
-                "_sort_group": 1,
-                "_sort_channel": HOMESHOPPING_CHANNEL_ORDER.get(display_channel, 99),
-            }
-        )
-
-    chart_df = pd.DataFrame(rows)
-    if chart_df.empty:
-        return pd.DataFrame(columns=["구분", "채널", "항목", "시작", "종료", "시작표시", "종료표시", "표시"])
-
-    chart_df = chart_df.sort_values(["_sort_group", "_sort_channel", "시작", "종료", "항목"])
-    chart_df["표시"] = chart_df["구분"] + " | " + chart_df["채널"] + " | " + chart_df["항목"]
-    return chart_df.drop(columns=["_sort_group", "_sort_channel"])
-
-
 def get_homeshopping_row_sort_key(row: dict[str, Any]) -> tuple[int, int, Any]:
     """홈쇼핑 채널을 CJ, 롯데, 현대, NS, 공영, 홈앤, 쇼핑엔티 순서로 정렬합니다."""
     channel = str(row.get("채널", ""))
@@ -987,7 +905,6 @@ def export_results(
     broadcast_end: datetime,
     tv_df: pd.DataFrame,
     homeshopping_df: pd.DataFrame,
-    chart_df: pd.DataFrame,
 ) -> bytes:
     """결과를 엑셀 파일의 한 시트에 모아서 만듭니다."""
     output = BytesIO()
@@ -1007,16 +924,6 @@ def export_results(
         worksheet.cell(row=row, column=1, value="홈쇼핑 편성표")
         homeshopping_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=row)
 
-        if not chart_df.empty:
-            row += len(homeshopping_df) + 3
-            worksheet.cell(row=row, column=1, value="그래프 데이터")
-            format_chart_export_df(chart_df).to_excel(
-                writer,
-                index=False,
-                sheet_name=sheet_name,
-                startrow=row,
-            )
-
         adjust_excel_sheet_widths(worksheet)
 
     return output.getvalue()
@@ -1029,7 +936,7 @@ def adjust_excel_sheet_widths(worksheet: Any) -> None:
 
     for row in worksheet.iter_rows():
         first_cell_value = row[0].value if row else None
-        if first_cell_value in ("공중파/TV 편성표", "홈쇼핑 편성표", "그래프 데이터"):
+        if first_cell_value in ("공중파/TV 편성표", "홈쇼핑 편성표"):
             row[0].font = Font(bold=True)
 
         for cell in row:
@@ -1050,30 +957,13 @@ def adjust_excel_sheet_widths(worksheet: Any) -> None:
     worksheet.freeze_panes = "A2"
 
 
-def format_chart_export_df(chart_df: pd.DataFrame) -> pd.DataFrame:
-    """그래프 데이터를 엑셀/클립보드에 보기 좋은 문자열 시간으로 변환합니다."""
-    export_df = chart_df[["구분", "채널", "항목", "시작", "종료"]].copy()
-    export_df["시작"] = export_df["시작"].dt.strftime("%Y-%m-%d %H:%M")
-    export_df["종료"] = export_df["종료"].dt.strftime("%Y-%m-%d %H:%M")
-    return export_df
-
-
 def build_clipboard_text(
     broadcast_start: datetime,
     broadcast_end: datetime,
     tv_df: pd.DataFrame,
     homeshopping_df: pd.DataFrame,
-    chart_df: pd.DataFrame,
 ) -> str:
     """엑셀/스프레드시트에 바로 붙여넣기 좋은 탭 구분 텍스트를 만듭니다."""
-    chart_text = ""
-    if not chart_df.empty:
-        chart_text = format_chart_export_df(chart_df).to_csv(
-            index=False,
-            sep="\t",
-            lineterminator="\n",
-        ).strip()
-
     sections = [
         f"내 방송 시간\t{format_broadcast_window(broadcast_start, broadcast_end)}",
         "",
@@ -1082,68 +972,8 @@ def build_clipboard_text(
         "",
         "[홈쇼핑 편성표]",
         homeshopping_df.to_csv(index=False, sep="\t", lineterminator="\n").strip(),
-        "",
-        "[그래프 데이터]",
-        chart_text,
     ]
     return "\n".join(sections)
-
-
-def render_timeline_chart(
-    chart_df: pd.DataFrame,
-    broadcast_start: datetime,
-    broadcast_end: datetime,
-) -> None:
-    """TV와 홈쇼핑 편성을 한 시간축에서 볼 수 있는 타임라인 그래프를 표시합니다."""
-    st.subheader("편성 타임라인 그래프")
-    if chart_df.empty:
-        st.info("그래프로 표시할 편성 데이터가 없습니다.")
-        return
-
-    display_df = chart_df.copy()
-    display_df["표시"] = display_df["표시"].str.slice(0, 90)
-    sort_order = list(dict.fromkeys(display_df["표시"]))
-    chart_height = max(260, min(900, 32 * len(display_df) + 80))
-    x_min = min(display_df["시작"].min(), broadcast_start) - timedelta(minutes=10)
-    x_max = max(display_df["종료"].max(), broadcast_end) + timedelta(minutes=10)
-
-    bars = (
-        alt.Chart(display_df)
-        .mark_bar(size=16, clip=True)
-        .encode(
-            x=alt.X("시작:T", title="시간", scale=alt.Scale(domain=[x_min, x_max])),
-            x2="종료:T",
-            y=alt.Y("표시:N", sort=sort_order, title=None),
-            color=alt.Color(
-                "구분:N",
-                title="구분",
-                scale=alt.Scale(domain=["TV", "홈쇼핑"], range=["#4C78A8", "#F58518"]),
-            ),
-            tooltip=[
-                alt.Tooltip("구분:N"),
-                alt.Tooltip("채널:N"),
-                alt.Tooltip("항목:N"),
-                alt.Tooltip("시작표시:N", title="시작"),
-                alt.Tooltip("종료표시:N", title="종료"),
-            ],
-        )
-    )
-    rules = (
-        alt.Chart(
-            pd.DataFrame(
-                {
-                    "시간": [broadcast_start, broadcast_end],
-                    "기준": ["내 방송 시작", "내 방송 종료"],
-                }
-            )
-        )
-        .mark_rule(strokeDash=[4, 4], color="#D62728", size=2)
-        .encode(
-            x="시간:T",
-            tooltip=[alt.Tooltip("기준:N"), alt.Tooltip("시간:T", format="%H:%M")],
-        )
-    )
-    st.altair_chart((bars + rules).properties(height=chart_height), use_container_width=True)
 
 
 def render_results(
@@ -1151,7 +981,6 @@ def render_results(
     broadcast_end: datetime,
     tv_df: pd.DataFrame,
     homeshopping_df: pd.DataFrame,
-    chart_df: pd.DataFrame,
     tv_errors: list[str],
     homeshopping_errors: list[str],
 ) -> None:
@@ -1173,14 +1002,11 @@ def render_results(
         st.info("선택한 방송 시간대와 겹치는 홈쇼핑 편성이 없습니다. 날짜, 시간, 채널 선택을 확인해주세요.")
     st.dataframe(homeshopping_df, use_container_width=True, hide_index=True)
 
-    render_timeline_chart(chart_df, broadcast_start, broadcast_end)
-
     clipboard_text = build_clipboard_text(
         broadcast_start,
         broadcast_end,
         tv_df,
         homeshopping_df,
-        chart_df,
     )
 
     st.subheader("복사")
@@ -1193,7 +1019,6 @@ def render_results(
             broadcast_end,
             tv_df,
             homeshopping_df,
-            chart_df,
         )
         st.download_button(
             label="엑셀 다운로드",
@@ -1215,7 +1040,7 @@ def run_search(
     selected_homeshopping_channels: list[str],
     broadcast_start: datetime,
     broadcast_end: datetime,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
     """조회, fallback, 필터링을 한 번에 실행합니다."""
     tv_channels = resolve_tv_channels(selected_tv_options)
 
@@ -1249,21 +1074,12 @@ def run_search(
             broadcast_end,
         )
         if not fallback_df.empty:
-            homeshopping_schedules = fallback_schedules
             homeshopping_df = fallback_df
             homeshopping_errors = []
         elif fallback_errors and not homeshopping_errors:
             homeshopping_errors = fallback_errors
 
-    chart_df = build_timeline_chart_data(
-        tv_programs,
-        homeshopping_schedules,
-        selected_homeshopping_channels,
-        broadcast_start,
-        broadcast_end,
-    )
-
-    return tv_df, homeshopping_df, chart_df, tv_errors, homeshopping_errors
+    return tv_df, homeshopping_df, tv_errors, homeshopping_errors
 
 
 def render_input_form() -> tuple[bool, dict[str, Any]]:
@@ -1317,9 +1133,6 @@ def main() -> None:
 
     submitted, inputs = render_input_form()
 
-    if "last_result" in st.session_state and "chart_df" not in st.session_state["last_result"]:
-        del st.session_state["last_result"]
-
     # 첫 화면에서도 기본값으로 한 번 조회되게 하여 초보자가 바로 결과 형태를 볼 수 있게 합니다.
     should_search = submitted or "last_result" not in st.session_state
 
@@ -1343,7 +1156,7 @@ def main() -> None:
             return
 
         with st.spinner("편성표를 조회하는 중입니다."):
-            tv_df, homeshopping_df, chart_df, tv_errors, homeshopping_errors = run_search(
+            tv_df, homeshopping_df, tv_errors, homeshopping_errors = run_search(
                 inputs["selected_tv_options"],
                 inputs["selected_homeshopping_channels"],
                 broadcast_start,
@@ -1355,7 +1168,6 @@ def main() -> None:
             "broadcast_end": broadcast_end,
             "tv_df": tv_df,
             "homeshopping_df": homeshopping_df,
-            "chart_df": chart_df,
             "tv_errors": tv_errors,
             "homeshopping_errors": homeshopping_errors,
         }
