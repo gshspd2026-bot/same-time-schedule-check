@@ -369,19 +369,60 @@ def fetch_epg_schedule_with_playwright(
             )
             page = context.new_page()
             page.goto(EPG_GUIDE_PAGE_URL, wait_until="domcontentloaded", timeout=20000)
-            page.goto(ajax_url, wait_until="domcontentloaded", timeout=20000)
-            body_text = page.locator("body").inner_text(timeout=5000).strip()
-            page_html = page.content()
+            page_html = load_epg_schedule_on_page(page, channel, target_date)
+            if not page_html:
+                page.goto(ajax_url, wait_until="domcontentloaded", timeout=20000)
+                body_text = page.locator("body").inner_text(timeout=5000).strip()
+                page_html = extract_tv_html_from_text(body_text) or page.content()
             context.close()
             browser.close()
 
-        html = extract_tv_html_from_text(body_text) or extract_tv_html_from_text(page_html)
+        html = extract_tv_html_from_text(page_html)
         if not html:
             return []
 
         return parse_tv_schedule_html(html, channel["label"], target_date)
     except Exception:
         return []
+
+
+def load_epg_schedule_on_page(page: Any, channel: dict[str, str], target_date: date) -> str:
+    """EPG Guide의 실제 페이지에서 AJAX를 실행해 편성표 HTML을 가져옵니다."""
+    try:
+        result = page.evaluate(
+            """
+            async ({url, category, mediaCode, ymd}) => {
+                const params = new URLSearchParams({
+                    cate_id: category,
+                    media_code: mediaCode,
+                    ymd,
+                });
+                const response = await fetch(`${url}?${params.toString()}`, {
+                    headers: {
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                    },
+                    credentials: "same-origin",
+                });
+                const text = await response.text();
+                try {
+                    const data = JSON.parse(text);
+                    return data.html || text;
+                } catch (error) {
+                    return text;
+                }
+            }
+            """,
+            {
+                "url": EPG_GUIDE_PROGRAM_URL,
+                "category": channel["category"],
+                "mediaCode": channel["media_code"],
+                "ymd": target_date.strftime("%Y%m%d"),
+            },
+        )
+        return str(result or "")
+    except Exception:
+        return ""
 
 
 def ensure_playwright_browser(sync_playwright: Any) -> bool:
