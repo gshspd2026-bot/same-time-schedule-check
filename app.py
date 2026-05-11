@@ -243,9 +243,17 @@ def fetch_tv_schedule(
                     raise ValueError("편성표 HTML이 비어 있습니다.")
                 programs.extend(parse_tv_schedule_html(html, channel["label"], target_date))
             except Exception as exc:
-                errors.append(f"{channel['label']} TV 편성표를 불러오지 못했습니다. ({exc})")
+                errors.append(f"{channel['label']}: {exc}")
 
     programs = add_tv_end_times(programs)
+    if errors and not programs:
+        return programs, [
+            "TV 편성표 사이트가 현재 실행 환경의 요청을 허용하지 않아 TV 데이터를 불러오지 못했습니다. "
+            "로컬 PC 실행에서는 정상 조회될 수 있습니다."
+        ]
+    if errors:
+        return programs, ["일부 TV 채널 편성표를 불러오지 못했습니다."]
+
     return programs, errors
 
 
@@ -990,9 +998,8 @@ def render_results(
 
     if tv_errors or homeshopping_errors:
         st.warning("데이터를 불러오지 못했습니다. 일부 결과가 샘플이거나 표시되지 않을 수 있습니다.")
-        with st.expander("크롤링 오류 상세 보기"):
-            for message in tv_errors + homeshopping_errors:
-                st.write(f"- {message}")
+        for message in tv_errors + homeshopping_errors:
+            st.caption(message)
 
     st.subheader("공중파/TV 편성표")
     st.dataframe(tv_df, use_container_width=True, hide_index=True)
@@ -1169,12 +1176,4 @@ def main() -> None:
             "tv_df": tv_df,
             "homeshopping_df": homeshopping_df,
             "tv_errors": tv_errors,
-            "homeshopping_errors": homeshopping_errors,
-        }
-
-    if "last_result" in st.session_state:
-        render_results(**st.session_state["last_result"])
-
-
-if __name__ == "__main__":
-    main()
+            "homeshopping_errors"
