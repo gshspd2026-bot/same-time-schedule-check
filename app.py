@@ -58,6 +58,31 @@ TV_CHANNEL_GROUPS = {
     ],
 }
 
+OFFICIAL_TV_SCHEDULE_URLS = {
+    "KBS1": lambda target_date: (
+        "https://schedule.kbs.co.kr/index.html"
+        f"?sname=schedule&stype=table&type=globalList&search_day={target_date:%Y%m%d}&channel_group=G01"
+    ),
+    "KBS2": lambda target_date: (
+        "https://schedule.kbs.co.kr/index.html"
+        f"?sname=schedule&stype=table&type=globalList&search_day={target_date:%Y%m%d}&channel_group=G01"
+    ),
+    "MBC": lambda target_date: (
+        f"https://schedule.imbc.com/?chcode=MBC&date={target_date:%Y%m%d}&m=0&c=0"
+    ),
+    "SBS": lambda target_date: (
+        f"https://www.sbs.co.kr/schedule/index.html?type=tv&channel=SBS&pmDate={target_date:%Y%m%d}"
+    ),
+    "JTBC": lambda target_date: f"https://jtbc.co.kr/schedule/jtbc/{target_date:%Y%m%d}",
+    "TV조선": lambda target_date: (
+        f"https://broadcast.tvchosun.com/onair/schedule/today.cstv?date={target_date:%Y%m%d}"
+    ),
+    "채널A": lambda target_date: (
+        f"https://ichannela.com/com/cmm/schedule.do?selectedDate={target_date:%Y%m%d}"
+    ),
+    "MBN": lambda target_date: f"https://www.mbn.co.kr/vod/schedule?date={target_date:%Y%m%d}",
+}
+
 
 # 라방바 데이터랩 홈쇼핑 편성표에서 사용하는 홈쇼핑 채널 코드입니다.
 HOMESHOPPING_CHANNELS = {
@@ -256,6 +281,15 @@ def fetch_tv_schedule(
 
     for channel in selected_channels:
         for target_date in dates_to_fetch:
+            official_programs = fetch_official_tv_schedule(
+                channel["label"],
+                target_date,
+                session,
+            )
+            if official_programs:
+                programs.extend(official_programs)
+                continue
+
             params = {
                 "cate_id": channel["category"],
                 "media_code": channel["media_code"],
@@ -286,6 +320,149 @@ def fetch_tv_schedule(
         return programs, ["일부 TV 채널 편성표를 불러오지 못했습니다."]
 
     return programs, errors
+
+
+def fetch_official_tv_schedule(
+    channel_name: str,
+    schedule_date: date,
+    session: requests.Session,
+) -> list[dict[str, Any]]:
+    """방송사 공식 편성표 페이지에서 시간/프로그램명을 우선 가져옵니다."""
+    url_builder = OFFICIAL_TV_SCHEDULE_URLS.get(channel_name)
+    if url_builder is None:
+        return []
+
+    try:
+        url = url_builder(schedule_date)
+        response = get_page(
+            url,
+            headers={**REQUEST_HEADERS, "Referer": url},
+            timeout=15,
+            allow_insecure_retry=True,
+            session=session,
+        )
+        response.raise_for_status()
+        return parse_official_tv_schedule_html(response.text, channel_name, schedule_date)
+    except Exception:
+        return []
+
+
+def parse_official_tv_schedule_html(
+    html: str,
+    channel_name: str,
+    schedule_date: date,
+) -> list[dict[str, Any]]:
+    """
+    공식 방송사 편성표 HTML에서 시간과 제목을 추출합니다.
+
+    방송사마다 HTML 구조가 달라서 우선 텍스트 흐름에서 HH:MM 다음에 나오는
+    프로그램명 후보를 찾습니다. 실패하면 기존 EPG Guide fallback이 동작합니다.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    text_items = [normalize_space(text) for text in soup.stripped_strings]
+    text_items = [text for text in text_items if text]
+
+    programs: list[dict[str, Any]] = []
+    seen_starts: set[datetime] = set()
+
+    for index, text in enumerate(text_items):
+        start_clock = parse_schedule_time_token(text)
+        if start_clock is None:
+            continue
+
+        title = find_official_program_title(text_items, index + 1)
+        if not title:
+            continue
+
+        start_dt = datetime.combine(schedule_date, start_clock)
+        if start_dt in seen_starts:
+            continue
+        seen_starts.add(start_dt)
+
+        programs.append(
+            {
+                "channel": channel_name,
+                "program_name": title,
+                "start": start_dt,
+            }
+        )
+
+    if len(programs) < 3:
+        return []
+
+    return programs
+
+
+def parse_schedule_time_token(text: str) -> time | None:
+    """편성표의 HH:MM 시간 토큰을 time 객체로 바꿉니다."""
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text.strip())
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    return time(hour=hour, minute=minute)
+
+
+def find_official_program_title(text_items: list[str], start_index: int) -> str:
+    """시간 다음에 나오는 텍스트 중 프로그램명으로 보이는 값을 고릅니다."""
+    for text in text_items[start_index : start_index + 8]:
+        if parse_schedule_time_token(text) is not None:
+            return ""
+
+        title = clean_official_program_title(text)
+        if title:
+            return title
+
+    return ""
+
+
+def clean_official_program_title(text: str) -> str:
+    """공식 편성표 텍스트에서 등급/자막/다시보기 같은 부가 문구를 줄입니다."""
+    text = normalize_space(text)
+    if not text:
+        return ""
+
+    skip_words = {
+        "편성표",
+        "오늘",
+        "이전",
+        "다음",
+        "다시보기",
+        "인쇄하기",
+        "NOW ON",
+        "Now On",
+        "ON AIR",
+        "온에어",
+        "달력보기",
+        "날짜선택",
+        "등록된 편성정보가 없습니다.",
+    }
+    if text in skip_words:
+        return ""
+    if len(text) <= 1:
+        return ""
+    if re.fullmatch(r"(All|A|HD|본|재|생|자막|수어|해설|ON|No-ON|[0-9]{1,2})[\s\w가-힣+-]*", text):
+        return ""
+
+    text = re.sub(r"^\[[^\]]+\]\s*", "", text)
+    text = re.split(r"\s{2,}", text)[0]
+    text = re.sub(
+        r"\s+(All|A|HD|본|재|생|자막|수어|해설|ON|No-ON|폐쇄자막|화면해설|한국수어|[0-9]{1,2})"
+        r"(\s+(All|A|HD|본|재|생|자막|수어|해설|ON|No-ON|폐쇄자막|화면해설|한국수어|[0-9]{1,2}))*$",
+        "",
+        text,
+    )
+
+    return text.strip()
+
+
+def normalize_space(text: str) -> str:
+    """여러 줄/공백 문자를 하나의 공백으로 정리합니다."""
+    return " ".join(str(text).split())
 
 
 def parse_tv_schedule_html(
