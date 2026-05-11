@@ -162,6 +162,7 @@ def get_page(
     url: str,
     *,
     allow_insecure_retry: bool = False,
+    session: requests.Session | None = None,
     **kwargs: Any,
 ) -> requests.Response:
     """
@@ -170,8 +171,9 @@ def get_page(
     회사 보안망이나 VPN에서 자체 인증서를 끼워 넣으면 SSL 검증 오류가 날 수 있습니다.
     홈쇼핑 조회처럼 필요한 경우에만 allow_insecure_retry=True로 한 번 더 재시도합니다.
     """
+    requester = session or requests
     try:
-        return requests.get(url, **kwargs)
+        return requester.get(url, **kwargs)
     except requests.exceptions.SSLError:
         if not allow_insecure_retry:
             raise
@@ -179,7 +181,7 @@ def get_page(
         requests.packages.urllib3.disable_warnings(
             requests.packages.urllib3.exceptions.InsecureRequestWarning
         )
-        return requests.get(url, verify=False, **kwargs)
+        return requester.get(url, verify=False, **kwargs)
 
 
 def get_json_response(response: requests.Response) -> dict[str, Any]:
@@ -200,6 +202,25 @@ def get_json_response(response: requests.Response) -> dict[str, Any]:
     return data
 
 
+def extract_tv_html_from_response(response: requests.Response) -> str:
+    """EPG Guide 응답에서 편성표 HTML을 꺼냅니다."""
+    text = response.text.strip()
+    if not text:
+        raise ValueError("편성표 사이트가 빈 응답을 반환했습니다.")
+
+    try:
+        data = get_json_response(response)
+        html = str(data.get("html", ""))
+        if html:
+            return html
+    except ValueError:
+        # 일부 환경에서는 JSON이 아니라 편성표 HTML 조각 또는 전체 HTML이 바로 올 수 있습니다.
+        if "inner_dl" in text or "id=\"time" in text or "id='time" in text:
+            return text
+
+    raise ValueError("TV 편성표 사이트가 현재 실행 환경의 요청을 허용하지 않았습니다.")
+
+
 def fetch_tv_schedule(
     selected_channels: list[dict[str, str]],
     broadcast_start: datetime,
@@ -213,6 +234,18 @@ def fetch_tv_schedule(
     """
     errors: list[str] = []
     programs: list[dict[str, Any]] = []
+    session = requests.Session()
+
+    try:
+        get_page(
+            EPG_GUIDE_PAGE_URL,
+            headers=TV_REQUEST_HEADERS,
+            timeout=15,
+            session=session,
+        )
+    except Exception:
+        # 메인 페이지 사전 방문은 쿠키 확보용 보조 절차라 실패해도 실제 조회를 시도합니다.
+        pass
 
     dates_to_fetch = [broadcast_start.date()]
 
@@ -235,12 +268,10 @@ def fetch_tv_schedule(
                     params=params,
                     headers=TV_REQUEST_HEADERS,
                     timeout=15,
+                    session=session,
                 )
                 response.raise_for_status()
-                data = get_json_response(response)
-                html = data.get("html", "")
-                if not html:
-                    raise ValueError("편성표 HTML이 비어 있습니다.")
+                html = extract_tv_html_from_response(response)
                 programs.extend(parse_tv_schedule_html(html, channel["label"], target_date))
             except Exception as exc:
                 errors.append(f"{channel['label']}: {exc}")
