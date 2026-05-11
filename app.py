@@ -48,7 +48,6 @@ TV_CHANNEL_GROUPS = {
     "KBS2": [{"label": "KBS2", "category": "1", "media_code": "00003"}],
     "MBC": [{"label": "MBC", "category": "1", "media_code": "00004"}],
     "SBS": [{"label": "SBS", "category": "1", "media_code": "00005"}],
-    "EBS": [{"label": "EBS1", "category": "1", "media_code": "00001"}],
     "tvN": [{"label": "tvN", "category": "4", "media_code": "00230"}],
     "종편": [
         {"label": "JTBC", "category": "13", "media_code": "00771"},
@@ -359,6 +358,10 @@ def parse_official_tv_schedule_html(
     프로그램명 후보를 찾습니다. 실패하면 기존 EPG Guide fallback이 동작합니다.
     """
     soup = BeautifulSoup(html, "lxml")
+    selector_programs = parse_official_schedule_by_selectors(soup, channel_name, schedule_date)
+    if len(selector_programs) >= 3:
+        return selector_programs
+
     text_items = [normalize_space(text) for text in soup.stripped_strings]
     text_items = [text for text in text_items if text]
 
@@ -390,7 +393,61 @@ def parse_official_tv_schedule_html(
     if len(programs) < 3:
         return []
 
-    return programs
+    return deduplicate_programs(programs)
+
+
+def parse_official_schedule_by_selectors(
+    soup: BeautifulSoup,
+    channel_name: str,
+    schedule_date: date,
+) -> list[dict[str, Any]]:
+    """방송사별로 알려진 시간/제목 클래스가 있으면 그 구조로 먼저 파싱합니다."""
+    selector_pairs = [
+        (".spthours", ".spititle"),  # SBS
+        (".time", ".title"),
+        (".hour", ".title"),
+        (".program_time", ".program_title"),
+        (".schedule_time", ".schedule_title"),
+    ]
+
+    for time_selector, title_selector in selector_pairs:
+        time_nodes = soup.select(time_selector)
+        title_nodes = soup.select(title_selector)
+        if len(time_nodes) < 3 or len(title_nodes) < 3:
+            continue
+
+        programs: list[dict[str, Any]] = []
+        for time_node, title_node in zip(time_nodes, title_nodes):
+            start_clock = parse_schedule_time_token(time_node.get_text(strip=True))
+            title = clean_official_program_title(title_node.get_text(" ", strip=True))
+            if start_clock is None or not title:
+                continue
+
+            programs.append(
+                {
+                    "channel": channel_name,
+                    "program_name": title,
+                    "start": datetime.combine(schedule_date, start_clock),
+                }
+            )
+
+        if len(programs) >= 3:
+            return deduplicate_programs(programs)
+
+    return []
+
+
+def deduplicate_programs(programs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """같은 채널/시작시간/제목이 반복 파싱되면 한 번만 남깁니다."""
+    results: list[dict[str, Any]] = []
+    seen: set[tuple[str, datetime, str]] = set()
+    for program in programs:
+        key = (program["channel"], program["start"], program["program_name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(program)
+    return results
 
 
 def parse_schedule_time_token(text: str) -> time | None:
@@ -1308,16 +1365,15 @@ def render_input_form() -> tuple[bool, dict[str, Any]]:
         duration_minutes = col3.number_input("방송분", min_value=1, max_value=600, value=70, step=5)
 
         st.markdown("**TV 채널 선택**")
-        tv_cols = st.columns(7)
         tv_defaults = {
             "KBS1": True,
             "KBS2": True,
             "MBC": True,
             "SBS": True,
-            "EBS": False,
             "tvN": False,
             "종편": False,
         }
+        tv_cols = st.columns(len(tv_defaults))
         selected_tv_options: list[str] = []
         for index, (label, checked) in enumerate(tv_defaults.items()):
             if tv_cols[index].checkbox(label, value=checked):
