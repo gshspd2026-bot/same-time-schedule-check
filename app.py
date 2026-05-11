@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
@@ -14,6 +16,7 @@ from bs4 import BeautifulSoup
 
 
 APP_TITLE = "동시간대 편성 체크"
+PLAYWRIGHT_BROWSER_READY = False
 
 # 크롤링 대상 사이트입니다.
 # 사이트 구조가 바뀌면 fetch_tv_schedule(), fetch_homeshopping_schedule()만
@@ -307,7 +310,14 @@ def fetch_tv_schedule(
                 html = extract_tv_html_from_response(response)
                 programs.extend(parse_tv_schedule_html(html, channel["label"], target_date))
             except Exception as exc:
-                errors.append(f"{channel['label']}: {exc}")
+                playwright_programs = fetch_epg_schedule_with_playwright(
+                    channel,
+                    target_date,
+                )
+                if playwright_programs:
+                    programs.extend(playwright_programs)
+                else:
+                    errors.append(f"{channel['label']}: {exc}")
 
     programs = add_tv_end_times(programs)
     if errors and not programs:
@@ -319,6 +329,116 @@ def fetch_tv_schedule(
         return programs, ["일부 TV 채널 편성표를 불러오지 못했습니다."]
 
     return programs, errors
+
+
+def fetch_epg_schedule_with_playwright(
+    channel: dict[str, str],
+    target_date: date,
+) -> list[dict[str, Any]]:
+    """requests가 막힐 때 Chromium 브라우저로 EPG Guide 편성표를 다시 시도합니다."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return []
+
+    if not ensure_playwright_browser(sync_playwright):
+        return []
+
+    params = {
+        "cate_id": channel["category"],
+        "media_code": channel["media_code"],
+        "ymd": target_date.strftime("%Y%m%d"),
+    }
+    query = "&".join(f"{key}={value}" for key, value in params.items())
+    ajax_url = f"{EPG_GUIDE_PROGRAM_URL}?{query}"
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(
+                user_agent=REQUEST_HEADERS["User-Agent"],
+                locale="ko-KR",
+                extra_http_headers={
+                    "Accept-Language": REQUEST_HEADERS["Accept-Language"],
+                    "Referer": EPG_GUIDE_PAGE_URL,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            page = context.new_page()
+            page.goto(EPG_GUIDE_PAGE_URL, wait_until="domcontentloaded", timeout=20000)
+            page.goto(ajax_url, wait_until="domcontentloaded", timeout=20000)
+            body_text = page.locator("body").inner_text(timeout=5000).strip()
+            page_html = page.content()
+            context.close()
+            browser.close()
+
+        html = extract_tv_html_from_text(body_text) or extract_tv_html_from_text(page_html)
+        if not html:
+            return []
+
+        return parse_tv_schedule_html(html, channel["label"], target_date)
+    except Exception:
+        return []
+
+
+def ensure_playwright_browser(sync_playwright: Any) -> bool:
+    """Chromium 브라우저가 없으면 한 번 설치를 시도합니다."""
+    global PLAYWRIGHT_BROWSER_READY
+    if PLAYWRIGHT_BROWSER_READY:
+        return True
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            browser.close()
+        PLAYWRIGHT_BROWSER_READY = True
+        return True
+    except Exception:
+        pass
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+            timeout=120,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            browser.close()
+        PLAYWRIGHT_BROWSER_READY = True
+        return True
+    except Exception:
+        return False
+
+
+def extract_tv_html_from_text(text: str) -> str:
+    """문자열에서 EPG Guide 편성표 HTML을 꺼냅니다."""
+    text = text.strip()
+    if not text:
+        return ""
+
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and data.get("html"):
+            return str(data["html"])
+    except Exception:
+        pass
+
+    if "inner_dl" in text or "id=\"time" in text or "id='time" in text:
+        return text
+
+    return ""
 
 
 def fetch_official_tv_schedule(
