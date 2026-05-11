@@ -1176,4 +1176,12 @@ def main() -> None:
             "tv_df": tv_df,
             "homeshopping_df": homeshopping_df,
             "tv_errors": tv_errors,
-            "homeshopping_errors"
+            "homeshopping_errors": homeshopping_errors,
+        }
+
+    if "last_result" in st.session_state:
+        render_results(**st.session_state["last_result"])
+
+
+if __name__ == "__main__":
+    main()
