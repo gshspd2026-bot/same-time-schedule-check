@@ -374,8 +374,8 @@ def parse_ip_tv_guide_html(
     """IP TV Guide HTML 테이블에서 선택 채널의 편성 시간과 프로그램명을 추출합니다."""
     soup = BeautifulSoup(html, "lxml")
     header_cells = soup.select("table#main_channel td")
-    channel_index = find_ip_tv_channel_index(header_cells, channel_name)
-    if channel_index is None:
+    column_index = find_ip_tv_column_index(header_cells, channel_name, schedule_date)
+    if column_index is None:
         return []
 
     rows = soup.select("table#result_tbl > tr")
@@ -387,8 +387,8 @@ def parse_ip_tv_guide_html(
             continue
 
         channel_cells = row.find_all("td", recursive=False)
-        # 첫 번째 td는 시간 컬럼이므로 채널 인덱스에 1을 더합니다.
-        target_cell_index = channel_index + 1
+        # 첫 번째 td는 시간 컬럼이므로 데이터 컬럼 인덱스에 1을 더합니다.
+        target_cell_index = column_index + 1
         if target_cell_index >= len(channel_cells):
             continue
 
@@ -404,19 +404,30 @@ def parse_ip_tv_guide_html(
     return deduplicate_programs(programs)
 
 
-def find_ip_tv_channel_index(header_cells: list[Any], channel_name: str) -> int | None:
-    """IP TV Guide의 헤더에서 선택 채널이 몇 번째 데이터 컬럼인지 찾습니다."""
-    channels: list[str] = []
+def find_ip_tv_column_index(
+    header_cells: list[Any],
+    channel_name: str,
+    schedule_date: date,
+) -> int | None:
+    """IP TV Guide의 헤더에서 선택할 데이터 컬럼 위치를 찾습니다."""
+    labels: list[str] = []
     for cell in header_cells:
         text = normalize_space(cell.get_text(" ", strip=True))
         if not text or "시간" in text:
             continue
         if "◀" in text or "▶" in text:
             continue
-        channels.append(text)
+        labels.append(text)
 
-    for index, name in enumerate(channels):
+    # 채널을 지정하지 않은 목록형 페이지는 헤더가 KBS1/KBS2/MBC처럼 채널명입니다.
+    for index, name in enumerate(labels):
         if name == channel_name:
+            return index
+
+    # c=채널코드로 들어간 상세 페이지는 헤더가 05.11/05.12처럼 날짜입니다.
+    target_day = schedule_date.strftime("%m.%d")
+    for index, name in enumerate(labels):
+        if target_day in name:
             return index
 
     return None
