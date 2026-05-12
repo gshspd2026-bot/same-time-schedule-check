@@ -26,6 +26,7 @@ EPG_GUIDE_PROGRAM_URL = "http://www.epgguide.co.kr/mod/ajax.get_program.php"
 ECOMM_SCHEDULE_PAGE_URL = "https://live.ecomm-data.com/schedule/hs"
 ECOMM_DATA_BASE_URL = "https://live.ecomm-data.com/_next/data"
 HSMOA_SCHEDULE_URL = "https://api.hsmoa.net/v3/schedule"
+IP_TV_GUIDE_URL = "http://211.43.210.44/tvguide/index.php"
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -47,16 +48,16 @@ TV_REQUEST_HEADERS = {
 
 # EPG Guide 사이트에서 확인한 채널 코드입니다.
 TV_CHANNEL_GROUPS = {
-    "KBS1": [{"label": "KBS1", "category": "1", "media_code": "00002"}],
-    "KBS2": [{"label": "KBS2", "category": "1", "media_code": "00003"}],
-    "MBC": [{"label": "MBC", "category": "1", "media_code": "00004"}],
-    "SBS": [{"label": "SBS", "category": "1", "media_code": "00005"}],
-    "tvN": [{"label": "tvN", "category": "4", "media_code": "00230"}],
+    "KBS1": [{"label": "KBS1", "category": "1", "media_code": "00002", "ip_main": "public", "ip_code": "9"}],
+    "KBS2": [{"label": "KBS2", "category": "1", "media_code": "00003", "ip_main": "public", "ip_code": "7"}],
+    "MBC": [{"label": "MBC", "category": "1", "media_code": "00004", "ip_main": "public", "ip_code": "11"}],
+    "SBS": [{"label": "SBS", "category": "1", "media_code": "00005", "ip_main": "public", "ip_code": "6"}],
+    "tvN": [{"label": "tvN", "category": "4", "media_code": "00230", "ip_main": "cable", "ip_code": "743"}],
     "종편": [
-        {"label": "JTBC", "category": "13", "media_code": "00771"},
-        {"label": "TV조선", "category": "13", "media_code": "00773"},
-        {"label": "채널A", "category": "13", "media_code": "00772"},
-        {"label": "MBN", "category": "13", "media_code": "00770"},
+        {"label": "JTBC", "category": "13", "media_code": "00771", "ip_main": "organization", "ip_code": "570"},
+        {"label": "TV조선", "category": "13", "media_code": "00773", "ip_main": "organization", "ip_code": "569"},
+        {"label": "채널A", "category": "13", "media_code": "00772", "ip_main": "organization", "ip_code": "571"},
+        {"label": "MBN", "category": "13", "media_code": "00770", "ip_main": "organization", "ip_code": "20"},
     ],
 }
 
@@ -283,6 +284,11 @@ def fetch_tv_schedule(
 
     for channel in selected_channels:
         for target_date in dates_to_fetch:
+            ip_guide_programs = fetch_ip_tv_guide_schedule(channel, target_date)
+            if ip_guide_programs:
+                programs.extend(ip_guide_programs)
+                continue
+
             official_programs = fetch_official_tv_schedule(
                 channel["label"],
                 target_date,
@@ -329,6 +335,151 @@ def fetch_tv_schedule(
         return programs, ["일부 TV 채널 편성표를 불러오지 못했습니다."]
 
     return programs, errors
+
+
+def fetch_ip_tv_guide_schedule(
+    channel: dict[str, str],
+    schedule_date: date,
+) -> list[dict[str, Any]]:
+    """IP 기반 TV Guide 페이지에서 선택 채널의 편성표를 가져옵니다."""
+    ip_main = channel.get("ip_main")
+    ip_code = channel.get("ip_code")
+    if not ip_main or not ip_code:
+        return []
+
+    try:
+        response = get_page(
+            IP_TV_GUIDE_URL,
+            params={
+                "main": ip_main,
+                "c": ip_code,
+                "day": schedule_date.strftime("%Y_%m_%d"),
+                "page": "",
+            },
+            headers={**REQUEST_HEADERS, "Referer": IP_TV_GUIDE_URL},
+            timeout=15,
+        )
+        response.raise_for_status()
+        response.encoding = "euc-kr"
+        return parse_ip_tv_guide_html(response.text, channel["label"], schedule_date)
+    except Exception:
+        return []
+
+
+def parse_ip_tv_guide_html(
+    html: str,
+    channel_name: str,
+    schedule_date: date,
+) -> list[dict[str, Any]]:
+    """IP TV Guide HTML 테이블에서 선택 채널의 편성 시간과 프로그램명을 추출합니다."""
+    soup = BeautifulSoup(html, "lxml")
+    header_cells = soup.select("table#main_channel td")
+    channel_index = find_ip_tv_channel_index(header_cells, channel_name)
+    if channel_index is None:
+        return []
+
+    rows = soup.select("table#result_tbl > tr")
+    programs: list[dict[str, Any]] = []
+
+    for row in rows:
+        hour = parse_ip_tv_hour(row)
+        if hour is None:
+            continue
+
+        channel_cells = row.find_all("td", recursive=False)
+        # 첫 번째 td는 시간 컬럼이므로 채널 인덱스에 1을 더합니다.
+        target_cell_index = channel_index + 1
+        if target_cell_index >= len(channel_cells):
+            continue
+
+        programs.extend(
+            parse_ip_tv_program_cell(
+                channel_cells[target_cell_index],
+                channel_name,
+                schedule_date,
+                hour,
+            )
+        )
+
+    return deduplicate_programs(programs)
+
+
+def find_ip_tv_channel_index(header_cells: list[Any], channel_name: str) -> int | None:
+    """IP TV Guide의 헤더에서 선택 채널이 몇 번째 데이터 컬럼인지 찾습니다."""
+    channels: list[str] = []
+    for cell in header_cells:
+        text = normalize_space(cell.get_text(" ", strip=True))
+        if not text or "시간" in text:
+            continue
+        if "◀" in text or "▶" in text:
+            continue
+        channels.append(text)
+
+    for index, name in enumerate(channels):
+        if name == channel_name:
+            return index
+
+    return None
+
+
+def parse_ip_tv_hour(row: BeautifulSoup) -> int | None:
+    """결과 테이블 행에서 시간 값을 읽습니다."""
+    first_cell = row.find("td")
+    if first_cell is None:
+        return None
+
+    text = normalize_space(first_cell.get_text(" ", strip=True))
+    match = re.search(r"(\d{1,2})\s*시", text)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    if 0 <= hour <= 23:
+        return hour
+
+    return None
+
+
+def parse_ip_tv_program_cell(
+    cell: BeautifulSoup,
+    channel_name: str,
+    schedule_date: date,
+    hour: int,
+) -> list[dict[str, Any]]:
+    """한 채널/한 시간대 셀에서 여러 프로그램을 추출합니다."""
+    programs: list[dict[str, Any]] = []
+    rows = cell.select("table tr")
+
+    for program_row in rows:
+        cells = program_row.find_all("td")
+        if len(cells) < 2:
+            continue
+
+        minute_text = normalize_space(cells[0].get_text(" ", strip=True))
+        minute_match = re.search(r"(\d{2})", minute_text)
+        if not minute_match:
+            continue
+
+        minute = int(minute_match.group(1))
+        if minute > 59:
+            continue
+
+        title_cell = cells[1]
+        for image in title_cell.find_all("img"):
+            image.decompose()
+        title = normalize_space(title_cell.get_text(" ", strip=True))
+        if not title:
+            continue
+
+        programs.append(
+            {
+                "channel": channel_name,
+                "program_name": title,
+                "start": datetime.combine(schedule_date, time(hour=hour, minute=minute)),
+            }
+        )
+
+    return programs
 
 
 def fetch_epg_schedule_with_playwright(
