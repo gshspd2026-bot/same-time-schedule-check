@@ -910,7 +910,7 @@ def clean_tv_program_title(item: BeautifulSoup) -> str:
 
 
 def add_tv_end_times(programs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """같은 채널의 다음 프로그램 시작시간 -10분을 현재 프로그램 종료 예상 시간으로 사용합니다."""
+    """같은 채널의 다음 프로그램 시작시간에서 채널별 보정 시간을 뺀 값을 종료 예상 시간으로 사용합니다."""
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for program in programs:
         grouped[program["channel"]].append(program)
@@ -922,7 +922,11 @@ def add_tv_end_times(programs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         for index, program in enumerate(channel_programs):
             if index + 1 < len(channel_programs):
-                end_dt = channel_programs[index + 1]["start"] - timedelta(minutes=10)
+                next_start = channel_programs[index + 1]["start"]
+                duration_minutes = int((next_start - program["start"]).total_seconds() // 60)
+                end_dt = next_start - timedelta(
+                    minutes=get_tv_end_offset_minutes(program["channel"], duration_minutes)
+                )
             else:
                 # 다음 편성을 알 수 없을 때의 보수적 fallback입니다.
                 end_dt = program["start"] + timedelta(minutes=60)
@@ -934,6 +938,15 @@ def add_tv_end_times(programs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     results.sort(key=lambda item: (item["start"], item["channel"]))
     return results
+
+
+def get_tv_end_offset_minutes(channel: str, duration_minutes: int) -> int:
+    """채널/방송 길이에 따른 종료 예상 시간 보정값을 반환합니다."""
+    if channel == "KBS1":
+        return 3
+    if channel in {"KBS2", "MBC", "SBS"}:
+        return 8 if duration_minutes >= 60 else 7
+    return 10
 
 
 def filter_tv_schedule(
@@ -953,11 +966,9 @@ def filter_tv_schedule(
         program_start = program["start"]
         program_end = program["end"]
 
-        # 표에는 겹치는 시간 컬럼을 만들지 않지만, 관련 편성을 찾기 위해 내부에서만 사용합니다.
-        overlaps_my_broadcast = program_start < broadcast_end and program_end > broadcast_start
+        # 내 방송 중에 종료되는 프로그램만 결과에 표시합니다.
         ends_during_my_broadcast = broadcast_start <= program_end <= broadcast_end
-        is_related = overlaps_my_broadcast or ends_during_my_broadcast
-        if not is_related:
+        if not ends_during_my_broadcast:
             continue
 
         grouped_rows[program["channel"]].append(
@@ -1501,8 +1512,9 @@ def export_results(
     broadcast_end: datetime,
     tv_df: pd.DataFrame,
     homeshopping_df: pd.DataFrame,
+    tv_programs: list[dict[str, Any]],
 ) -> bytes:
-    """결과를 엑셀 파일의 한 시트에 모아서 만듭니다."""
+    """결과를 엑셀 파일로 만들고, TV 종료 예상 시간을 도식화합니다."""
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         sheet_name = "편성결과"
@@ -1521,8 +1533,135 @@ def export_results(
         homeshopping_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=row)
 
         adjust_excel_sheet_widths(worksheet)
+        render_tv_ending_diagram_sheet(
+            writer.book,
+            tv_programs,
+            broadcast_start,
+            broadcast_end,
+        )
 
     return output.getvalue()
+
+
+def render_tv_ending_diagram_sheet(
+    workbook: Any,
+    tv_programs: list[dict[str, Any]],
+    broadcast_start: datetime,
+    broadcast_end: datetime,
+) -> None:
+    """방송 종료 예상 시간을 1분 단위 시간축 위 5분짜리 블럭으로 도식화합니다."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    sheet_name = "방송종료도식"
+    if sheet_name in workbook.sheetnames:
+        del workbook[sheet_name]
+    worksheet = workbook.create_sheet(sheet_name, 0)
+
+    total_minutes = max(1, int((broadcast_end - broadcast_start).total_seconds() // 60))
+    max_minutes = min(total_minutes, 600)
+    block_programs = get_tv_ending_block_programs(tv_programs, broadcast_start, broadcast_end)
+
+    worksheet["A1"] = "동시간대 편성 체크"
+    worksheet["A1"].font = Font(bold=True, size=14)
+    worksheet["A2"] = f"내 방송 시간: {format_broadcast_window(broadcast_start, broadcast_end)}"
+    worksheet["A4"] = "채널"
+    worksheet["A6"] = "시"
+    worksheet["A7"] = "분"
+
+    header_fill = PatternFill("solid", fgColor="E6E6E6")
+    minute_fill = PatternFill("solid", fgColor="F4F4F4")
+    thin_gray = Side(style="thin", color="D9D9D9")
+    medium_dark = Side(style="medium", color="404040")
+
+    for col_offset in range(max_minutes):
+        current = broadcast_start + timedelta(minutes=col_offset)
+        col = 2 + col_offset
+        hour_cell = worksheet.cell(row=6, column=col, value=current.hour)
+        minute_cell = worksheet.cell(row=7, column=col, value=current.minute)
+        hour_cell.fill = header_fill
+        minute_cell.fill = minute_fill
+        hour_cell.alignment = Alignment(horizontal="center", vertical="center")
+        minute_cell.alignment = Alignment(horizontal="center", vertical="center")
+        hour_cell.border = Border(top=thin_gray, bottom=thin_gray, left=thin_gray, right=thin_gray)
+        minute_cell.border = Border(top=thin_gray, bottom=thin_gray, left=thin_gray, right=thin_gray)
+        worksheet.column_dimensions[get_column_letter(col)].width = 3
+
+    row = 8
+    for program in block_programs:
+        end_dt = program["end"]
+        minute_offset = int((end_dt - broadcast_start).total_seconds() // 60)
+        if minute_offset < 0 or minute_offset >= max_minutes:
+            continue
+
+        start_col = 2 + minute_offset
+        end_col = min(start_col + 4, 1 + max_minutes)
+        channel = str(program["channel"])
+        label = f"{channel} {program['program_name']} {format_table_time(end_dt, broadcast_start.date())}"
+
+        worksheet.cell(row=row, column=1, value=channel)
+        worksheet.cell(row=row, column=1).font = Font(bold=True)
+        worksheet.cell(row=row, column=1).alignment = Alignment(horizontal="center", vertical="center")
+
+        worksheet.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=end_col)
+        block_cell = worksheet.cell(row=row, column=start_col, value=label)
+        block_cell.fill = PatternFill("solid", fgColor=get_tv_block_color(channel))
+        block_cell.font = Font(bold=True, size=8)
+        block_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for col in range(start_col, end_col + 1):
+            worksheet.cell(row=row, column=col).border = Border(
+                top=medium_dark,
+                bottom=medium_dark,
+                left=medium_dark if col == start_col else thin_gray,
+                right=medium_dark if col == end_col else thin_gray,
+            )
+
+        worksheet.row_dimensions[row].height = 28
+        row += 1
+
+    if not block_programs:
+        worksheet["A8"] = "내 방송 중 종료되는 TV 편성이 없습니다."
+
+    worksheet.column_dimensions["A"].width = 12
+    worksheet.freeze_panes = "B8"
+
+
+def get_tv_ending_block_programs(
+    tv_programs: list[dict[str, Any]],
+    broadcast_start: datetime,
+    broadcast_end: datetime,
+) -> list[dict[str, Any]]:
+    """내 방송 중 종료되는 TV 프로그램만 종료 시간순으로 정리합니다."""
+    programs = [
+        program
+        for program in tv_programs
+        if broadcast_start <= program.get("end", datetime.min) <= broadcast_end
+    ]
+    programs.sort(
+        key=lambda item: (
+            item["end"],
+            CORE_TV_CHANNEL_ORDER.get(str(item["channel"]), 99),
+            str(item["channel"]),
+        )
+    )
+    return programs
+
+
+def get_tv_block_color(channel: str) -> str:
+    """종료 도식 블럭의 채널별 배경색입니다."""
+    colors = {
+        "KBS1": "D9EAF7",
+        "KBS2": "B7DEE8",
+        "MBC": "D8EAD2",
+        "SBS": "FCE4D6",
+        "tvN": "E4DFEC",
+        "JTBC": "FFF2CC",
+        "TV조선": "EADCF8",
+        "채널A": "DDEBF7",
+        "MBN": "E2F0D9",
+    }
+    return colors.get(channel, "E7E6E6")
 
 
 def adjust_excel_sheet_widths(worksheet: Any) -> None:
@@ -1577,6 +1716,7 @@ def render_results(
     broadcast_end: datetime,
     tv_df: pd.DataFrame,
     homeshopping_df: pd.DataFrame,
+    tv_programs: list[dict[str, Any]],
     tv_errors: list[str],
     homeshopping_errors: list[str],
 ) -> None:
@@ -1614,6 +1754,7 @@ def render_results(
             broadcast_end,
             tv_df,
             homeshopping_df,
+            tv_programs,
         )
         st.download_button(
             label="엑셀 다운로드",
@@ -1635,7 +1776,7 @@ def run_search(
     selected_homeshopping_channels: list[str],
     broadcast_start: datetime,
     broadcast_end: datetime,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, list[dict[str, Any]], list[str], list[str]]:
     """조회, fallback, 필터링을 한 번에 실행합니다."""
     tv_channels = resolve_tv_channels(selected_tv_options)
 
@@ -1674,7 +1815,7 @@ def run_search(
         elif fallback_errors and not homeshopping_errors:
             homeshopping_errors = fallback_errors
 
-    return tv_df, homeshopping_df, tv_errors, homeshopping_errors
+    return tv_df, homeshopping_df, tv_programs, tv_errors, homeshopping_errors
 
 
 def render_input_form() -> tuple[bool, dict[str, Any]]:
@@ -1727,6 +1868,9 @@ def main() -> None:
 
     submitted, inputs = render_input_form()
 
+    if "last_result" in st.session_state and "tv_programs" not in st.session_state["last_result"]:
+        del st.session_state["last_result"]
+
     # 첫 화면에서도 기본값으로 한 번 조회되게 하여 초보자가 바로 결과 형태를 볼 수 있게 합니다.
     should_search = submitted or "last_result" not in st.session_state
 
@@ -1750,7 +1894,7 @@ def main() -> None:
             return
 
         with st.spinner("편성표를 조회하는 중입니다."):
-            tv_df, homeshopping_df, tv_errors, homeshopping_errors = run_search(
+            tv_df, homeshopping_df, tv_programs, tv_errors, homeshopping_errors = run_search(
                 inputs["selected_tv_options"],
                 inputs["selected_homeshopping_channels"],
                 broadcast_start,
@@ -1762,6 +1906,7 @@ def main() -> None:
             "broadcast_end": broadcast_end,
             "tv_df": tv_df,
             "homeshopping_df": homeshopping_df,
+            "tv_programs": tv_programs,
             "tv_errors": tv_errors,
             "homeshopping_errors": homeshopping_errors,
         }
