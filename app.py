@@ -1562,12 +1562,23 @@ def render_tv_ending_diagram_sheet(
     max_minutes = min(total_minutes, 600)
     block_programs = get_tv_ending_block_programs(tv_programs, broadcast_start, broadcast_end)
 
-    worksheet["A1"] = "동시간대 편성 체크"
-    worksheet["A1"].font = Font(bold=True, size=14)
-    worksheet["A2"] = f"내 방송 시간: {format_broadcast_window(broadcast_start, broadcast_end)}"
-    worksheet["A4"] = "채널"
-    worksheet["A6"] = "시"
+    block_start_row = 1
+    block_lane_count = 5
+    elapsed_row = 6
+    clock_minute_row = 7
+    cue_start_row = 8
+    cue_end_row = 13
+    repeated_minute_row = 14
+    block_rows = allocate_tv_ending_block_rows(
+        block_programs,
+        broadcast_start,
+        max_minutes,
+        lane_count=block_lane_count,
+    )
+
+    worksheet["A6"] = "방송분"
     worksheet["A7"] = "분"
+    worksheet.cell(row=repeated_minute_row, column=1, value="분")
 
     header_fill = PatternFill("solid", fgColor="E6E6E6")
     minute_fill = PatternFill("solid", fgColor="F4F4F4")
@@ -1577,18 +1588,42 @@ def render_tv_ending_diagram_sheet(
     for col_offset in range(max_minutes):
         current = broadcast_start + timedelta(minutes=col_offset)
         col = 2 + col_offset
-        hour_cell = worksheet.cell(row=6, column=col, value=current.hour)
-        minute_cell = worksheet.cell(row=7, column=col, value=current.minute)
-        hour_cell.fill = header_fill
+        elapsed_cell = worksheet.cell(row=elapsed_row, column=col, value=col_offset + 1)
+        minute_cell = worksheet.cell(row=clock_minute_row, column=col, value=current.minute)
+        repeated_minute_cell = worksheet.cell(row=repeated_minute_row, column=col, value=current.minute)
+
+        elapsed_cell.fill = header_fill
         minute_cell.fill = minute_fill
-        hour_cell.alignment = Alignment(horizontal="center", vertical="center")
-        minute_cell.alignment = Alignment(horizontal="center", vertical="center")
-        hour_cell.border = Border(top=thin_gray, bottom=thin_gray, left=thin_gray, right=thin_gray)
-        minute_cell.border = Border(top=thin_gray, bottom=thin_gray, left=thin_gray, right=thin_gray)
+        repeated_minute_cell.fill = minute_fill
+
+        for cell in (elapsed_cell, minute_cell, repeated_minute_cell):
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(top=thin_gray, bottom=thin_gray, left=thin_gray, right=thin_gray)
+            cell.font = Font(size=8)
+
         worksheet.column_dimensions[get_column_letter(col)].width = 3
 
-    row = 8
-    for program in block_programs:
+    for row in range(block_start_row, block_start_row + block_lane_count):
+        worksheet.row_dimensions[row].height = 25
+        for col in range(2, 2 + max_minutes):
+            worksheet.cell(row=row, column=col).border = Border(
+                top=thin_gray,
+                bottom=thin_gray,
+                left=thin_gray,
+                right=thin_gray,
+            )
+
+    for row in range(cue_start_row, cue_end_row + 1):
+        worksheet.row_dimensions[row].height = 22
+        for col in range(2, 2 + max_minutes):
+            worksheet.cell(row=row, column=col).border = Border(
+                top=thin_gray,
+                bottom=thin_gray,
+                left=thin_gray,
+                right=thin_gray,
+            )
+
+    for program, lane_index in block_rows:
         end_dt = program["end"]
         minute_offset = int((end_dt - broadcast_start).total_seconds() // 60)
         if minute_offset < 0 or minute_offset >= max_minutes:
@@ -1596,12 +1631,9 @@ def render_tv_ending_diagram_sheet(
 
         start_col = 2 + minute_offset
         end_col = min(start_col + 4, 1 + max_minutes)
+        row = block_start_row + lane_index
         channel = str(program["channel"])
-        label = f"{channel} {program['program_name']} {format_table_time(end_dt, broadcast_start.date())}"
-
-        worksheet.cell(row=row, column=1, value=channel)
-        worksheet.cell(row=row, column=1).font = Font(bold=True)
-        worksheet.cell(row=row, column=1).alignment = Alignment(horizontal="center", vertical="center")
+        label = f"{channel} {program['program_name']}"
 
         worksheet.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=end_col)
         block_cell = worksheet.cell(row=row, column=start_col, value=label)
@@ -1617,14 +1649,16 @@ def render_tv_ending_diagram_sheet(
                 right=medium_dark if col == end_col else thin_gray,
             )
 
-        worksheet.row_dimensions[row].height = 28
-        row += 1
-
     if not block_programs:
-        worksheet["A8"] = "내 방송 중 종료되는 TV 편성이 없습니다."
+        worksheet["A1"] = "내 방송 중 종료되는 TV 편성이 없습니다."
 
-    worksheet.column_dimensions["A"].width = 12
-    worksheet.freeze_panes = "B8"
+    for row in (elapsed_row, clock_minute_row, repeated_minute_row):
+        worksheet.cell(row=row, column=1).fill = header_fill
+        worksheet.cell(row=row, column=1).alignment = Alignment(horizontal="center", vertical="center")
+        worksheet.cell(row=row, column=1).font = Font(bold=True, size=8)
+
+    worksheet.column_dimensions["A"].width = 8
+    worksheet.freeze_panes = "B14"
 
 
 def get_tv_ending_block_programs(
@@ -1646,6 +1680,48 @@ def get_tv_ending_block_programs(
         )
     )
     return programs
+
+
+def allocate_tv_ending_block_rows(
+    programs: list[dict[str, Any]],
+    broadcast_start: datetime,
+    max_minutes: int,
+    lane_count: int = 6,
+) -> list[tuple[dict[str, Any], int]]:
+    """
+    종료 블럭을 6개 행에 배치합니다.
+
+    겹치는 블럭은 늦게 끝나는 방송을 위쪽 행에 먼저 배치하고,
+    먼저 끝나는 방송은 아래쪽 행으로 내려가게 합니다.
+    """
+    lanes: list[list[tuple[int, int]]] = [[] for _ in range(lane_count)]
+    placed: list[tuple[dict[str, Any], int]] = []
+
+    sorted_programs = sorted(
+        programs,
+        key=lambda item: (
+            item["end"],
+            CORE_TV_CHANNEL_ORDER.get(str(item["channel"]), 99),
+            str(item["channel"]),
+        ),
+        reverse=True,
+    )
+
+    for program in sorted_programs:
+        minute_offset = int((program["end"] - broadcast_start).total_seconds() // 60)
+        if minute_offset < 0 or minute_offset >= max_minutes:
+            continue
+
+        block_start = minute_offset
+        block_end = min(minute_offset + 4, max_minutes - 1)
+
+        for lane_index, lane_intervals in enumerate(lanes):
+            if all(block_end < start or block_start > end for start, end in lane_intervals):
+                lane_intervals.append((block_start, block_end))
+                placed.append((program, lane_index))
+                break
+
+    return placed
 
 
 def get_tv_block_color(channel: str) -> str:
