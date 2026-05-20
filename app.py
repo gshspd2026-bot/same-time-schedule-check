@@ -1685,8 +1685,9 @@ def render_tv_ending_diagram_sheet(
     max_minutes = min(total_minutes, 600)
     block_programs = get_tv_ending_block_programs(tv_programs, broadcast_start, broadcast_end)
 
-    block_start_row = 1
-    block_lane_count = 5
+    info_row = 1
+    block_start_row = 2
+    block_lane_count = 4
     elapsed_row = 6
     clock_minute_row = 7
     cue_start_row = 8
@@ -1705,6 +1706,16 @@ def render_tv_ending_diagram_sheet(
     thin_gray = Side(style="thin", color="D9D9D9")
     medium_dark = Side(style="medium", color="404040")
     summary_fill = PatternFill("solid", fgColor="DAEEF3")
+
+    time_label = format_cuesheet_time_label(broadcast_start, broadcast_end)
+    time_cell = worksheet["B1"]
+    time_cell.value = time_label
+    time_cell.font = Font(bold=True, size=10)
+    time_cell.alignment = Alignment(horizontal="left", vertical="center")
+    occupied_block_ranges: dict[int, list[tuple[int, int]]] = {
+        info_row: [(2, 1 + get_text_merge_width(time_label, max_minutes))]
+    }
+    worksheet.row_dimensions[info_row].height = 22
 
     for col_offset in range(max_minutes):
         current = broadcast_start + timedelta(minutes=col_offset)
@@ -1748,7 +1759,6 @@ def render_tv_ending_diagram_sheet(
                 right=thin_gray,
             )
 
-    occupied_block_ranges: dict[int, list[tuple[int, int]]] = {}
     for program, lane_index in block_rows:
         end_dt = program["end"]
         minute_offset = int((end_dt - broadcast_start).total_seconds() // 60)
@@ -1791,7 +1801,7 @@ def render_tv_ending_diagram_sheet(
             medium_dark,
         )
     elif not block_programs:
-        worksheet["B1"] = "내 방송 중 종료되는 TV 편성이 없습니다."
+        worksheet["B2"] = "내 방송 중 종료되는 TV 편성이 없습니다."
 
     first_time_col = 2
     last_time_col = 1 + max_minutes
@@ -1800,7 +1810,7 @@ def render_tv_ending_diagram_sheet(
 
     apply_range_outline(
         worksheet,
-        block_start_row,
+        info_row,
         repeated_minute_row,
         first_time_col,
         last_time_col,
@@ -1866,6 +1876,21 @@ def build_homeshopping_category_summary(
     return ", ".join(summary_parts)
 
 
+def format_cuesheet_time_label(broadcast_start: datetime, broadcast_end: datetime) -> str:
+    """큐시트 도식 상단에 표시할 방송 시간 문구를 만듭니다."""
+    duration_minutes = int((broadcast_end - broadcast_start).total_seconds() // 60)
+    return f"{broadcast_start:%H:%M} - {broadcast_end:%H:%M} ({duration_minutes}')"
+
+
+def get_text_merge_width(text: str, max_minutes: int) -> int:
+    """텍스트 길이에 맞춰 병합할 분 단위 셀 개수를 계산합니다."""
+    display_width = 0
+    for char in str(text):
+        display_width += 2 if ord(char) > 127 else 1
+
+    return min(max_minutes, max(4, (display_width + 2) // 3 + 2))
+
+
 def parse_table_datetime(value: Any, reference_date: date) -> datetime | None:
     """표에 표시된 HH:MM 또는 MM-DD HH:MM 값을 datetime으로 되돌립니다."""
     text = str(value or "").strip()
@@ -1894,13 +1919,14 @@ def render_homeshopping_summary_box(
 ) -> None:
     """TV 종료 블럭과 겹치지 않는 상단 빈 영역에 홈쇼핑 분류 요약을 표시합니다."""
     from openpyxl.styles import Alignment, Font
+    from openpyxl.utils import get_column_letter
 
-    width = min(max_minutes, max(18, min(42, len(summary_text) // 2 + 8)))
+    width = get_text_merge_width(summary_text, max_minutes)
     start_row, end_row, start_col, end_col = find_empty_summary_region(
         occupied_block_ranges,
         max_minutes,
         width,
-        height=2,
+        height=1,
     )
 
     worksheet.merge_cells(
@@ -1912,11 +1938,17 @@ def render_homeshopping_summary_box(
     summary_cell = worksheet.cell(row=start_row, column=start_col, value=summary_text)
     summary_cell.fill = fill
     summary_cell.font = Font(bold=True, size=9)
-    summary_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    summary_cell.alignment = Alignment(
+        horizontal="center",
+        vertical="center",
+        wrap_text=False,
+        shrink_to_fit=True,
+    )
 
     for row in range(start_row, end_row + 1):
-        worksheet.row_dimensions[row].height = max(worksheet.row_dimensions[row].height or 0, 28)
+        worksheet.row_dimensions[row].height = max(worksheet.row_dimensions[row].height or 0, 22)
         for col in range(start_col, end_col + 1):
+            worksheet.column_dimensions[get_column_letter(col)].width = 3
             cell = worksheet.cell(row=row, column=col)
             cell.fill = fill
             apply_cell_border(
