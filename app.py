@@ -87,6 +87,17 @@ OFFICIAL_TV_SCHEDULE_URLS = {
     "MBN": lambda target_date: f"https://www.mbn.co.kr/vod/schedule?date={target_date:%Y%m%d}",
 }
 
+MANUAL_TV_SCHEDULE_LINKS = {
+    "KBS1": "https://schedule.kbs.co.kr/",
+    "KBS2": "https://schedule.kbs.co.kr/",
+    "MBC": "https://schedule.imbc.com/",
+    "SBS": "https://www.sbs.co.kr/schedule/index.html?div=gnb_pc",
+    "JTBC": "https://jtbc.co.kr/schedule",
+    "TV조선": "https://broadcast.tvchosun.com/onair/schedule/today.cstv",
+    "채널A": "https://ichannela.com/com/cmm/schedule.do",
+    "MBN": "https://www.mbn.co.kr/vod/schedule",
+}
+
 
 # 라방바 데이터랩 홈쇼핑 편성표에서 사용하는 홈쇼핑 채널 코드입니다.
 HOMESHOPPING_CHANNELS = {
@@ -325,7 +336,10 @@ def fetch_tv_schedule(
                 )
                 response.raise_for_status()
                 html = extract_tv_html_from_response(response)
-                programs.extend(parse_tv_schedule_html(html, channel["label"], target_date))
+                parsed_programs = parse_tv_schedule_html(html, channel["label"], target_date)
+                if not parsed_programs:
+                    raise ValueError("편성 데이터가 비어 있습니다.")
+                programs.extend(parsed_programs)
             except Exception as exc:
                 playwright_programs = fetch_epg_schedule_with_playwright(
                     channel,
@@ -334,18 +348,15 @@ def fetch_tv_schedule(
                 if playwright_programs:
                     programs.extend(playwright_programs)
                 else:
-                    errors.append(f"{channel['label']}: {exc}")
+                    errors.append(format_tv_fetch_error(channel["label"], target_date, exc))
 
     programs = add_tv_end_times(programs)
-    if errors and not programs:
-        return programs, [
-            "TV 편성표 사이트가 현재 실행 환경의 요청을 허용하지 않아 TV 데이터를 불러오지 못했습니다. "
-            "로컬 PC 실행에서는 정상 조회될 수 있습니다."
-        ]
-    if errors:
-        return programs, ["일부 TV 채널 편성표를 불러오지 못했습니다."]
-
     return programs, errors
+
+
+def format_tv_fetch_error(channel_name: str, target_date: date, exc: Exception) -> str:
+    """화면에서 실패 채널과 공식 링크를 분리해 표시할 수 있도록 오류 문구를 통일합니다."""
+    return f"{channel_name} TV 편성표를 불러오지 못했습니다. ({target_date:%Y-%m-%d}, {exc})"
 
 
 def fetch_ip_tv_guide_schedule(
@@ -2187,6 +2198,39 @@ def build_clipboard_text(
     return "\n".join(sections)
 
 
+def render_failed_tv_schedule_links(tv_errors: list[str]) -> None:
+    """TV 크롤링 실패 채널이 있으면 직접 확인할 공식 편성표 링크를 보여줍니다."""
+    failed_channels = get_failed_tv_channels(tv_errors)
+    if not failed_channels:
+        return
+
+    st.info("자동 조회가 실패한 TV 채널은 아래 공식 편성표에서 직접 확인할 수 있습니다.")
+    for channel in failed_channels:
+        schedule_link = MANUAL_TV_SCHEDULE_LINKS.get(channel)
+        if schedule_link:
+            st.markdown(f"- **{channel}**: [편성표 열기]({schedule_link})")
+        else:
+            st.markdown(f"- **{channel}**: 등록된 공식 편성표 링크가 없습니다.")
+
+
+def get_failed_tv_channels(tv_errors: list[str]) -> list[str]:
+    """오류 메시지에서 실패한 TV 채널명을 중복 없이 추출합니다."""
+    failed_channels: list[str] = []
+    seen: set[str] = set()
+
+    for message in tv_errors:
+        match = re.match(r"^(.+?) TV 편성표를 불러오지 못했습니다\.", str(message))
+        if not match:
+            continue
+
+        channel = match.group(1).strip()
+        if channel and channel not in seen:
+            failed_channels.append(channel)
+            seen.add(channel)
+
+    return failed_channels
+
+
 def render_results(
     broadcast_start: datetime,
     broadcast_end: datetime,
@@ -2236,6 +2280,7 @@ def render_results(
         st.warning("데이터를 불러오지 못했습니다. 일부 결과가 샘플이거나 표시되지 않을 수 있습니다.")
         for message in tv_errors + homeshopping_errors:
             st.caption(message)
+        render_failed_tv_schedule_links(tv_errors)
 
     st.subheader("공중파/TV 편성표")
     st.dataframe(tv_df, use_container_width=True, hide_index=True)
