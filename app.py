@@ -27,6 +27,7 @@ ECOMM_SCHEDULE_PAGE_URL = "https://live.ecomm-data.com/schedule/hs"
 ECOMM_DATA_BASE_URL = "https://live.ecomm-data.com/_next/data"
 HSMOA_SCHEDULE_URL = "https://api.hsmoa.net/v3/schedule"
 IP_TV_GUIDE_URL = "http://211.43.210.44/tvguide/index.php"
+SBS_LIVE_SCHEDULE_URL = "https://www.sbs.co.kr/live/S01?div=live_end"
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -123,6 +124,16 @@ CORE_TV_CHANNEL_ORDER = {
 
 HOMESHOPPING_CHANNEL_ORDER = {
     channel_name: index for index, channel_name in enumerate(HOMESHOPPING_CHANNELS)
+}
+
+HOMESHOPPING_CHANNEL_SHORT_NAMES = {
+    "CJ온스타일": "CJ",
+    "롯데홈쇼핑": "롯데",
+    "현대홈쇼핑": "현대",
+    "NS홈쇼핑": "NS",
+    "공영쇼핑": "공영",
+    "홈앤쇼핑": "홈앤",
+    "쇼핑엔티": "엔티",
 }
 
 
@@ -650,6 +661,11 @@ def fetch_official_tv_schedule(
     session: requests.Session,
 ) -> list[dict[str, Any]]:
     """방송사 공식 편성표 페이지에서 시간/프로그램명을 우선 가져옵니다."""
+    if channel_name == "SBS" and schedule_date == get_korea_today():
+        sbs_live_programs = fetch_sbs_live_schedule(schedule_date, session)
+        if sbs_live_programs:
+            return sbs_live_programs
+
     url_builder = OFFICIAL_TV_SCHEDULE_URLS.get(channel_name)
     if url_builder is None:
         return []
@@ -667,6 +683,111 @@ def fetch_official_tv_schedule(
         return parse_official_tv_schedule_html(response.text, channel_name, schedule_date)
     except Exception:
         return []
+
+
+def get_korea_today() -> date:
+    """Streamlit Cloud가 UTC로 동작해도 오늘 날짜를 한국 기준으로 맞춥니다."""
+    return datetime.now(timezone(timedelta(hours=9))).date()
+
+
+def fetch_sbs_live_schedule(
+    schedule_date: date,
+    session: requests.Session,
+) -> list[dict[str, Any]]:
+    """SBS 공식 라이브 페이지의 Next.js 데이터에서 오늘 편성표를 가져옵니다."""
+    try:
+        response = get_page(
+            SBS_LIVE_SCHEDULE_URL,
+            headers={**REQUEST_HEADERS, "Referer": SBS_LIVE_SCHEDULE_URL},
+            timeout=15,
+            allow_insecure_retry=True,
+            session=session,
+        )
+        response.raise_for_status()
+        return parse_sbs_live_schedule_html(response.text, schedule_date)
+    except Exception:
+        return []
+
+
+def parse_sbs_live_schedule_html(
+    html: str,
+    schedule_date: date,
+) -> list[dict[str, Any]]:
+    """SBS 라이브 페이지의 __NEXT_DATA__ 안에서 schedules 배열을 찾아 파싱합니다."""
+    try:
+        data = extract_next_data(html)
+    except Exception:
+        return []
+
+    schedule_items = find_largest_schedule_items(data)
+    programs: list[dict[str, Any]] = []
+    for item in schedule_items:
+        if not isinstance(item, dict):
+            continue
+
+        start_dt = parse_sbs_live_start_time(item.get("start_time"), schedule_date)
+        title = clean_official_program_title(str(item.get("title") or ""))
+        if start_dt is None or not title:
+            continue
+
+        programs.append(
+            {
+                "channel": "SBS",
+                "program_name": title,
+                "start": start_dt,
+            }
+        )
+
+    if len(programs) < 3:
+        return []
+
+    return deduplicate_programs(programs)
+
+
+def find_largest_schedule_items(data: Any) -> list[dict[str, Any]]:
+    """중첩된 JSON에서 SBS 편성표로 보이는 schedules 목록 중 가장 큰 목록을 찾습니다."""
+    candidates: list[list[dict[str, Any]]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            schedules = value.get("schedules")
+            if isinstance(schedules, list):
+                valid_items = [
+                    item
+                    for item in schedules
+                    if isinstance(item, dict) and item.get("start_time") and item.get("title")
+                ]
+                if valid_items:
+                    candidates.append(valid_items)
+
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
+    if not candidates:
+        return []
+
+    return max(candidates, key=len)
+
+
+def parse_sbs_live_start_time(value: Any, schedule_date: date) -> datetime | None:
+    """SBS start_time 값을 datetime으로 바꿉니다. 24:20 같은 익일 표기도 처리합니다."""
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if minute > 59:
+        return None
+
+    day_offset = hour // 24
+    hour = hour % 24
+    return datetime.combine(schedule_date + timedelta(days=day_offset), time(hour=hour, minute=minute))
 
 
 def parse_official_tv_schedule_html(
@@ -1536,6 +1657,7 @@ def export_results(
         render_tv_ending_diagram_sheet(
             writer.book,
             tv_programs,
+            homeshopping_df,
             broadcast_start,
             broadcast_end,
         )
@@ -1546,6 +1668,7 @@ def export_results(
 def render_tv_ending_diagram_sheet(
     workbook: Any,
     tv_programs: list[dict[str, Any]],
+    homeshopping_df: pd.DataFrame,
     broadcast_start: datetime,
     broadcast_end: datetime,
 ) -> None:
@@ -1581,6 +1704,7 @@ def render_tv_ending_diagram_sheet(
     elapsed_yellow_fill = PatternFill("solid", fgColor="FFF2CC")
     thin_gray = Side(style="thin", color="D9D9D9")
     medium_dark = Side(style="medium", color="404040")
+    summary_fill = PatternFill("solid", fgColor="DAEEF3")
 
     for col_offset in range(max_minutes):
         current = broadcast_start + timedelta(minutes=col_offset)
@@ -1624,6 +1748,7 @@ def render_tv_ending_diagram_sheet(
                 right=thin_gray,
             )
 
+    occupied_block_ranges: dict[int, list[tuple[int, int]]] = {}
     for program, lane_index in block_rows:
         end_dt = program["end"]
         minute_offset = int((end_dt - broadcast_start).total_seconds() // 60)
@@ -1635,6 +1760,7 @@ def render_tv_ending_diagram_sheet(
         row = elapsed_row - 1 - lane_index
         channel = str(program["channel"])
         label = f"{channel} {program['program_name']}"
+        occupied_block_ranges.setdefault(row, []).append((start_col, end_col))
 
         worksheet.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=end_col)
         block_cell = worksheet.cell(row=row, column=start_col, value=label)
@@ -1650,14 +1776,250 @@ def render_tv_ending_diagram_sheet(
                 right=medium_dark if col == end_col else thin_gray,
             )
 
-    if not block_programs:
+    homeshopping_summary = build_homeshopping_category_summary(
+        homeshopping_df,
+        broadcast_start,
+        broadcast_end,
+    )
+    if homeshopping_summary:
+        render_homeshopping_summary_box(
+            worksheet,
+            homeshopping_summary,
+            occupied_block_ranges,
+            max_minutes,
+            summary_fill,
+            medium_dark,
+        )
+    elif not block_programs:
         worksheet["B1"] = "내 방송 중 종료되는 TV 편성이 없습니다."
+
+    first_time_col = 2
+    last_time_col = 1 + max_minutes
+    for row in (elapsed_row, clock_minute_row, repeated_minute_row):
+        apply_row_full_borders(worksheet, row, first_time_col, last_time_col, medium_dark)
+
+    apply_range_outline(
+        worksheet,
+        block_start_row,
+        repeated_minute_row,
+        first_time_col,
+        last_time_col,
+        medium_dark,
+    )
 
     for row in range(1, repeated_minute_row + 1):
         worksheet.cell(row=row, column=1, value=None)
 
     worksheet.column_dimensions["A"].width = 3
     worksheet.freeze_panes = "B14"
+
+
+def build_homeshopping_category_summary(
+    homeshopping_df: pd.DataFrame,
+    broadcast_start: datetime,
+    broadcast_end: datetime,
+) -> str:
+    """홈쇼핑 채널별로 가장 오래 겹치는 편성의 분류만 짧게 요약합니다."""
+    if homeshopping_df.empty:
+        return ""
+
+    best_by_channel: dict[str, dict[str, Any]] = {}
+    for _, row in homeshopping_df.iterrows():
+        channel = str(row.get("채널", "")).strip()
+        if not channel:
+            continue
+
+        start_dt = parse_table_datetime(row.get("방송 시작시간"), broadcast_start.date())
+        end_dt = parse_table_datetime(row.get("방송 종료시간"), broadcast_start.date())
+        if start_dt is None or end_dt is None:
+            overlap_minutes = 0
+        else:
+            if end_dt <= start_dt:
+                end_dt += timedelta(days=1)
+            overlap_minutes = max(
+                0,
+                int(
+                    (
+                        min(end_dt, broadcast_end) - max(start_dt, broadcast_start)
+                    ).total_seconds()
+                    // 60
+                ),
+            )
+
+        category = str(row.get("분류", "")).strip() or "분류 확인 필요"
+        current_best = best_by_channel.get(channel)
+        if current_best is None or overlap_minutes > current_best["overlap_minutes"]:
+            best_by_channel[channel] = {
+                "category": category,
+                "overlap_minutes": overlap_minutes,
+            }
+
+    summary_parts: list[str] = []
+    sorted_channels = sorted(
+        best_by_channel,
+        key=lambda channel: HOMESHOPPING_CHANNEL_ORDER.get(channel, 999),
+    )
+    for channel in sorted_channels:
+        short_name = HOMESHOPPING_CHANNEL_SHORT_NAMES.get(channel, channel)
+        summary_parts.append(f"{short_name}-{best_by_channel[channel]['category']}")
+
+    return ", ".join(summary_parts)
+
+
+def parse_table_datetime(value: Any, reference_date: date) -> datetime | None:
+    """표에 표시된 HH:MM 또는 MM-DD HH:MM 값을 datetime으로 되돌립니다."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    try:
+        if re.match(r"^\d{1,2}:\d{2}$", text):
+            return datetime.combine(reference_date, datetime.strptime(text, "%H:%M").time())
+
+        parsed = datetime.strptime(f"{reference_date.year}-{text}", "%Y-%m-%d %H:%M")
+        if parsed.date() < reference_date:
+            parsed = parsed.replace(year=reference_date.year + 1)
+        return parsed
+    except ValueError:
+        return None
+
+
+def render_homeshopping_summary_box(
+    worksheet: Any,
+    summary_text: str,
+    occupied_block_ranges: dict[int, list[tuple[int, int]]],
+    max_minutes: int,
+    fill: Any,
+    border_side: Any,
+) -> None:
+    """TV 종료 블럭과 겹치지 않는 상단 빈 영역에 홈쇼핑 분류 요약을 표시합니다."""
+    from openpyxl.styles import Alignment, Font
+
+    width = min(max_minutes, max(18, min(42, len(summary_text) // 2 + 8)))
+    start_row, end_row, start_col, end_col = find_empty_summary_region(
+        occupied_block_ranges,
+        max_minutes,
+        width,
+        height=2,
+    )
+
+    worksheet.merge_cells(
+        start_row=start_row,
+        start_column=start_col,
+        end_row=end_row,
+        end_column=end_col,
+    )
+    summary_cell = worksheet.cell(row=start_row, column=start_col, value=summary_text)
+    summary_cell.fill = fill
+    summary_cell.font = Font(bold=True, size=9)
+    summary_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for row in range(start_row, end_row + 1):
+        worksheet.row_dimensions[row].height = max(worksheet.row_dimensions[row].height or 0, 28)
+        for col in range(start_col, end_col + 1):
+            cell = worksheet.cell(row=row, column=col)
+            cell.fill = fill
+            apply_cell_border(
+                cell,
+                top=border_side if row == start_row else None,
+                bottom=border_side if row == end_row else None,
+                left=border_side if col == start_col else None,
+                right=border_side if col == end_col else None,
+            )
+
+
+def find_empty_summary_region(
+    occupied_block_ranges: dict[int, list[tuple[int, int]]],
+    max_minutes: int,
+    width: int,
+    height: int = 2,
+) -> tuple[int, int, int, int]:
+    """도식 상단 1~4행에서 요약 박스를 넣을 빈 영역을 찾습니다."""
+    first_col = 2
+    last_col = 1 + max_minutes
+    top_row = 1
+    bottom_row = 4
+    width = min(width, max_minutes)
+
+    for row in range(top_row, bottom_row - height + 2):
+        for start_col in range(first_col, last_col - width + 2):
+            end_col = start_col + width - 1
+            if all(
+                not is_region_occupied(occupied_block_ranges, target_row, start_col, end_col)
+                for target_row in range(row, row + height)
+            ):
+                return row, row + height - 1, start_col, end_col
+
+    outside_start_col = last_col + 2
+    return top_row, top_row + height - 1, outside_start_col, outside_start_col + width - 1
+
+
+def is_region_occupied(
+    occupied_block_ranges: dict[int, list[tuple[int, int]]],
+    row: int,
+    start_col: int,
+    end_col: int,
+) -> bool:
+    """지정한 행/열 구간이 기존 TV 종료 블럭과 겹치는지 확인합니다."""
+    for occupied_start, occupied_end in occupied_block_ranges.get(row, []):
+        if start_col <= occupied_end and end_col >= occupied_start:
+            return True
+    return False
+
+
+def apply_row_full_borders(
+    worksheet: Any,
+    row: int,
+    first_col: int,
+    last_col: int,
+    border_side: Any,
+) -> None:
+    """분 단위 행의 모든 칸에 굵은 테두리를 적용합니다."""
+    for col in range(first_col, last_col + 1):
+        apply_cell_border(
+            worksheet.cell(row=row, column=col),
+            top=border_side,
+            bottom=border_side,
+            left=border_side,
+            right=border_side,
+        )
+
+
+def apply_range_outline(
+    worksheet: Any,
+    first_row: int,
+    last_row: int,
+    first_col: int,
+    last_col: int,
+    border_side: Any,
+) -> None:
+    """도식 전체 바깥쪽에 굵은 테두리를 적용합니다."""
+    for col in range(first_col, last_col + 1):
+        apply_cell_border(worksheet.cell(row=first_row, column=col), top=border_side)
+        apply_cell_border(worksheet.cell(row=last_row, column=col), bottom=border_side)
+
+    for row in range(first_row, last_row + 1):
+        apply_cell_border(worksheet.cell(row=row, column=first_col), left=border_side)
+        apply_cell_border(worksheet.cell(row=row, column=last_col), right=border_side)
+
+
+def apply_cell_border(
+    cell: Any,
+    top: Any | None = None,
+    bottom: Any | None = None,
+    left: Any | None = None,
+    right: Any | None = None,
+) -> None:
+    """기존 셀 테두리를 유지하면서 필요한 방향만 교체합니다."""
+    from openpyxl.styles import Border
+
+    current = cell.border
+    cell.border = Border(
+        top=top or current.top,
+        bottom=bottom or current.bottom,
+        left=left or current.left,
+        right=right or current.right,
+    )
 
 
 def get_tv_ending_block_programs(
@@ -1803,7 +2165,39 @@ def render_results(
     homeshopping_errors: list[str],
 ) -> None:
     """Streamlit 화면에 요약, 표, 다운로드 버튼을 출력합니다."""
-    st.subheader("조회 결과")
+    clipboard_text = build_clipboard_text(
+        broadcast_start,
+        broadcast_end,
+        tv_df,
+        homeshopping_df,
+    )
+
+    title_col, download_col = st.columns([3, 1])
+    with title_col:
+        st.subheader("조회 결과")
+    with download_col:
+        try:
+            excel_bytes = export_results(
+                broadcast_start,
+                broadcast_end,
+                tv_df,
+                homeshopping_df,
+                tv_programs,
+            )
+            st.download_button(
+                label="큐시트 출력",
+                data=excel_bytes,
+                file_name=f"동시간대_편성_체크_{broadcast_start:%Y%m%d_%H%M}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception:
+            st.download_button(
+                label="CSV 다운로드",
+                data=clipboard_text.encode("utf-8-sig"),
+                file_name=f"동시간대_편성_체크_{broadcast_start:%Y%m%d_%H%M}.csv",
+                mime="text/csv",
+            )
+
     st.info(f"내 방송 시간: {format_broadcast_window(broadcast_start, broadcast_end)}")
 
     if tv_errors or homeshopping_errors:
@@ -1819,38 +2213,9 @@ def render_results(
         st.info("선택한 방송 시간대와 겹치는 홈쇼핑 편성이 없습니다. 날짜, 시간, 채널 선택을 확인해주세요.")
     st.dataframe(homeshopping_df, use_container_width=True, hide_index=True)
 
-    clipboard_text = build_clipboard_text(
-        broadcast_start,
-        broadcast_end,
-        tv_df,
-        homeshopping_df,
-    )
-
     st.subheader("복사")
     st.caption("아래 칸을 클릭한 뒤 Ctrl+A, Ctrl+C로 복사하세요.")
     st.text_area("클립보드 복사용 텍스트", value=clipboard_text, height=260)
-
-    try:
-        excel_bytes = export_results(
-            broadcast_start,
-            broadcast_end,
-            tv_df,
-            homeshopping_df,
-            tv_programs,
-        )
-        st.download_button(
-            label="엑셀 다운로드",
-            data=excel_bytes,
-            file_name=f"동시간대_편성_체크_{broadcast_start:%Y%m%d_%H%M}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    except Exception:
-        st.download_button(
-            label="CSV 다운로드",
-            data=clipboard_text.encode("utf-8-sig"),
-            file_name=f"동시간대_편성_체크_{broadcast_start:%Y%m%d_%H%M}.csv",
-            mime="text/csv",
-        )
 
 
 def run_search(
